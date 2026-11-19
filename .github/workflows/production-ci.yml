@@ -1,0 +1,113 @@
+name: Production CI
+
+on:
+  push:
+    branches:
+      - main
+      - "phase-r-*"
+      - "phase-s/**"
+    paths:
+      - "app/**"
+      - "native/**"
+      - "scripts/ci/**"
+      - "scripts/vps/**"
+      - "gradle/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "native/**"
+      - "scripts/ci/**"
+      - "scripts/vps/**"
+      - "gradle/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-gate:
+    name: Release build and production gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Configure Git default branch
+        shell: bash
+        run: git config --global init.defaultBranch main
+
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate production policy
+        shell: bash
+        run: bash scripts/ci/validate-production.sh
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK 37.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --channel=3 \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
+      - name: Build release, lint and test
+        shell: bash
+        run: |
+          ./gradlew --no-daemon \
+            :app:assembleRelease \
+            :app:bundleRelease \
+            :app:testDebugUnitTest \
+            :app:lintRelease
+
+      - name: Scan release candidate artifacts for secrets
+        shell: bash
+        run: bash scripts/ci/scan-android-artifacts-for-secrets.sh
+
+      - name: Verify VPS release signing integration
+        shell: bash
+        run: bash scripts/vps/test-android-release-integration.sh
+
+      - name: Enforce artifact size budgets
+        shell: bash
+        run: bash scripts/ci/check-artifact-size.sh
+
+      - name: Upload release candidate artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: NexoraGit-release-candidate
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/bundle/release/*.aab
+            app/build/outputs/native-debug-symbols/release/*.zip
+            app/build/reports/lint-results-release.html
+          if-no-files-found: warn
+          retention-days: 7

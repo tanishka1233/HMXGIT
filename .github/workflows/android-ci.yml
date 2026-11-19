@@ -1,0 +1,105 @@
+name: Android CI
+
+on:
+  push:
+    branches:
+      - main
+      - "phase-*"
+    paths:
+      - "app/**"
+      - "native/**"
+      - "gradle/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/android-ci.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "native/**"
+      - "gradle/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/android-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Build, lint and unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Configure Git default branch
+        shell: bash
+        run: git config --global init.defaultBranch main
+
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK 37.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --channel=3 \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      - name: Set up Gradle cache and wrapper validation
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
+      - name: Validate localized product surfaces
+        shell: bash
+        run: python3 scripts/ci/validate-localization-surfaces.py
+
+      - name: Build, lint and test
+        shell: bash
+        env:
+          NEXORA_GITHUB_CLIENT_ID: Iv1.NexoraObfuscationSentinel
+          NEXORA_AUTH_BROKER_BASE_URL: https://obfuscation-sentinel.example
+          NEXORA_GITHUB_CALLBACK_URL: https://obfuscation-sentinel.example/oauth/callback
+        run: |
+          ./gradlew --no-daemon \
+            :app:assembleDebug \
+            :app:assembleDebugAndroidTest \
+            :baselineprofile:assemble \
+            :app:testDebugUnitTest \
+            :app:lintDebug
+
+      - name: Verify runtime configuration obfuscation
+        shell: bash
+        env:
+          NEXORA_GITHUB_CLIENT_ID: Iv1.NexoraObfuscationSentinel
+          NEXORA_AUTH_BROKER_BASE_URL: https://obfuscation-sentinel.example
+          NEXORA_GITHUB_CALLBACK_URL: https://obfuscation-sentinel.example/oauth/callback
+        run: bash scripts/ci/validate-runtime-config-obfuscation.sh
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: NexoraGit-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
