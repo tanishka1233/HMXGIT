@@ -7,6 +7,8 @@
 > **Verification date:** 2026-11-19 (UTC)
 > **Mode:** CI observation + one CI-only workflow trigger change. **No application source code,
 > Gradle, native code or assets were modified.**
+> **Post-baseline addendum:** §12 records the owner-authorised BUG-001 repair at `729f11c`; §1–§10
+> remain the baseline snapshot and are unchanged by it.
 
 ---
 
@@ -308,18 +310,34 @@ The night variant keeps `windowLightStatusBar=false` (attr `0x010104e0=false`); 
 keeps `true`. So the compiled artifact contains the intended fix in the exact configuration that
 previously crashed.
 
-### 12.5 Device launch verification — NOT COMPLETE
+### 12.5 Device launch verification — INSTALLED, NOT YET LAUNCHED
 
-Per the owner's instruction, no local Gradle build was run. The CI APK was downloaded for an
-on-device test, but the wireless-ADB connection dropped during the install flow
-(`192.168.0.103:45165` → `offline`, then connection refused; the host is still pingable, so the
-debug port rotated or wireless debugging was switched off).
+Per the owner's instruction, no local Gradle build was run. The CI APK (`app-debug.apk`, 70 258 381
+bytes) was downloaded and installed on the physical OPPO device (CPH2579, Android 15). The install
+went through the ColorOS installer confirmation, which broke the wireless-ADB session.
 
-Therefore:
+The installed artifact was then verified by hash **on the device**:
 
-- the fix is **committed, CI-verified and present in the built APK**;
+```
+sha256 /data/app/~~HBuGPe7e2LSTnMaqqjJixA==/com.nexora.git.debug-BJ_gi_cipqtUAVTT7xwiqA==/base.apk
+  = 26ed0d7fab0aeea3e1ef35208d4d1e166524b40f77ead9d1080151910232a91c
+sha256 app-debug.apk (CI artifact)
+  = 26ed0d7fab0aeea3e1ef35208d4d1e166524b40f77ead9d1080151910232a91c
+```
+
+So the **fixed build is the one installed** on the device, in place of the crashing build.
+
+Launch could not be performed from the automation host: the wireless-ADB transport is gone
+(`192.168.0.103:45165` → `offline`, then connection refused; the host still answers ICMP, so the
+debug port rotated or wireless debugging was switched off), and the Termux-side `am`/`cmd` calls are
+denied for the app UID (`FORCE_STOP_PACKAGES` / background-activity permission denials).
+
+Status therefore:
+
+- the fix is **committed, CI-verified, present in the APK and installed on the device**;
 - an actual post-fix launch on the physical OPPO device has **not** been observed;
 - the crash is **not** claimed as fixed until that launch succeeds.
 
 Reproduction steps for the pending test are in report 15.
+
 
