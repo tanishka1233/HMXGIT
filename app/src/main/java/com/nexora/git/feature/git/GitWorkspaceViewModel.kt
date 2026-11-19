@@ -1,0 +1,1259 @@
+package com.nexora.git.feature.git
+
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.work.WorkInfo
+import androidx.lifecycle.viewModelScope
+import com.nexora.git.core.git.GitApplyResult
+import com.nexora.git.core.git.GitAuthor
+import com.nexora.git.core.git.GitBranch
+import com.nexora.git.core.git.GitConflict
+import com.nexora.git.core.git.GitConflictResolution
+import com.nexora.git.core.git.GitDivergence
+import com.nexora.git.core.git.GitEngine
+import com.nexora.git.core.git.GitHistoryEntry
+import com.nexora.git.core.git.GitLfsManager
+import com.nexora.git.core.git.GitLfsState
+import com.nexora.git.core.git.GitLfsTransport
+import com.nexora.git.core.git.GitMergeResult
+import com.nexora.git.core.git.GitPullRequest
+import com.nexora.git.core.git.GitPullStrategy
+import com.nexora.git.core.git.GitPushRequest
+import com.nexora.git.core.git.GitRemote
+import com.nexora.git.core.git.GitResetMode
+import com.nexora.git.core.git.GitRepositoryOperationState
+import com.nexora.git.core.git.GitStatusEntry
+import com.nexora.git.core.git.GitStash
+import com.nexora.git.core.git.GitSubmodule
+import com.nexora.git.core.git.GitTag
+import com.nexora.git.core.storage.WorkspaceRegistry
+import com.nexora.git.core.work.DurableGitOperations
+import com.nexora.git.core.work.DurableGitWorker
+import dagger.hilt.android.lifecycle.HiltViewModel
+import java.io.File
+import java.util.UUID
+import javax.inject.Inject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+data class GitWorkspaceUiState(
+    val workspaceName: String = "",
+    val repositoryPath: String = "",
+    val branch: String = "",
+    val entries: List<GitStatusEntry> = emptyList(),
+    val history: List<GitHistoryEntry> = emptyList(),
+    val branches: List<GitBranch> = emptyList(),
+    val remotes: List<GitRemote> = emptyList(),
+    val conflicts: List<GitConflict> = emptyList(),
+    val divergence: GitDivergence? = null,
+    val repositoryState: GitRepositoryOperationState =
+        GitRepositoryOperationState.NONE,
+    val stashes: List<GitStash> = emptyList(),
+    val tags: List<GitTag> = emptyList(),
+    val submodules: List<GitSubmodule> = emptyList(),
+    val lfs: GitLfsState = GitLfsState(
+        trackedPatterns = emptyList(),
+        pointers = emptyList(),
+    ),
+    val loading: Boolean = true,
+    val refreshing: Boolean = false,
+    val operationInProgress: Boolean = false,
+    val durableOperationId: String? = null,
+    val durableOperationPhase: String? = null,
+    val errorMessage: String? = null,
+    val successMessage: String? = null,
+) {
+    val stagedEntries: List<GitStatusEntry>
+        get() = entries.filter { it.staged }
+
+    val unstagedEntries: List<GitStatusEntry>
+        get() = entries.filter {
+            it.workingTree || it.untracked || it.conflicted
+        }
+
+    val localBranches: List<GitBranch>
+        get() = branches.filterNot { it.remote }
+
+    val remoteBranches: List<GitBranch>
+        get() = branches.filter { it.remote }
+
+    val currentBranch: GitBranch?
+        get() = localBranches.firstOrNull { it.head }
+
+    val currentUpstream: String
+        get() = currentBranch?.upstream.orEmpty()
+
+    val rebaseInProgress: Boolean
+        get() = repositoryState == GitRepositoryOperationState.REBASE
+
+    val mergeInProgress: Boolean
+        get() = repositoryState == GitRepositoryOperationState.MERGE
+
+    val cherryPickInProgress: Boolean
+        get() = repositoryState ==
+            GitRepositoryOperationState.CHERRY_PICK
+
+    val revertInProgress: Boolean
+        get() = repositoryState ==
+            GitRepositoryOperationState.REVERT
+}
+
+@HiltViewModel
+class GitWorkspaceViewModel @Inject constructor(
+    private val savedStateHandle: SavedStateHandle,
+    private val workspaceRegistry: WorkspaceRegistry,
+    private val gitEngine: GitEngine,
+    private val lfsManager: GitLfsManager,
+    private val lfsTransport: GitLfsTransport,
+    private val durableGitOperations: DurableGitOperations,
+) : ViewModel() {
+
+    private val workspaceId =
+        savedStateHandle.get<String>("workspaceId").orEmpty()
+
+    private var workspacePath: String = ""
+
+    private val mutableState = MutableStateFlow(
+        GitWorkspaceUiState(),
+    )
+    val state: StateFlow<GitWorkspaceUiState> =
+        mutableState.asStateFlow()
+
+    init {
+        load()
+        restoreDurableOperation()
+    }
+
+    fun refresh() {
+        viewModelScope.launch {
+            refreshInternal(showBusy = true)
+        }
+    }
+
+    fun stage(path: String) {
+        launchOperation("Staged " + path + ".") {
+            val entry = state.value.entries.firstOrNull {
+                it.path == path
+            }
+            require(entry?.conflicted != true) {
+                "Resolve this conflict in the editor before staging it."
+            }
+            gitEngine.stage(
+                repositoryPath = workspacePath,
+                paths = listOf(path),
+            )
+        }
+    }
+
+    fun unstage(path: String) {
+        launchOperation("Unstaged " + path + ".") {
+            gitEngine.unstage(
+                repositoryPath = workspacePath,
+                paths = listOf(path),
+            )
+        }
+    }
+
+    fun stageAll() {
+        val paths = state.value.entries
+            .asSequence()
+            .filter {
+                !it.conflicted &&
+                    (it.workingTree || it.untracked)
+            }
+            .map { it.path }
+            .distinct()
+            .toList()
+
+        if (paths.isEmpty()) {
+            showError(
+                "There are no resolvable working-tree changes to stage.",
+            )
+            return
+        }
+
+        launchOperation(
+            "Staged " + paths.size + " changed path(s).",
+        ) {
+            gitEngine.stage(workspacePath, paths)
+        }
+    }
+
+    fun unstageAll() {
+        val paths = state.value.stagedEntries
+            .map { it.path }
+            .distinct()
+
+        if (paths.isEmpty()) {
+            showError("There are no staged changes.")
+            return
+        }
+
+        launchOperation(
+            "Unstaged " + paths.size + " path(s).",
+        ) {
+            gitEngine.unstage(workspacePath, paths)
+        }
+    }
+
+    fun commit(
+        message: String,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        if (message.isBlank()) {
+            showError("Commit message is required.")
+            return
+        }
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        if (state.value.stagedEntries.isEmpty()) {
+            showError("Stage at least one change before committing.")
+            return
+        }
+
+        if (state.value.repositoryState !=
+            GitRepositoryOperationState.NONE
+        ) {
+            showError(
+                "Finish the current merge or rebase before creating a normal commit.",
+            )
+            return
+        }
+
+        launchOperation {
+            val commit = gitEngine.commit(
+                repositoryPath = workspacePath,
+                message = message.trim(),
+                author = author,
+            )
+            "Committed " + commit.oid.take(7) + "."
+        }
+    }
+
+    fun createBranch(name: String) {
+        val branch = runCatching {
+            GitWorkflowPolicy.normalizeBranchName(name)
+        }.getOrElse {
+            showError(it.message ?: "Invalid branch name.")
+            return
+        }
+
+        launchOperation("Created and switched to " + branch + ".") {
+            gitEngine.createBranch(
+                repositoryPath = workspacePath,
+                name = branch,
+            )
+            gitEngine.checkout(
+                repositoryPath = workspacePath,
+                ref = branch,
+            )
+        }
+    }
+
+    fun checkout(branch: String) {
+        if (state.value.repositoryState !=
+            GitRepositoryOperationState.NONE
+        ) {
+            showError(
+                "Finish or abort the current Git operation before switching branches.",
+            )
+            return
+        }
+
+        launchOperation("Switched to " + branch + ".") {
+            gitEngine.checkout(
+                repositoryPath = workspacePath,
+                ref = branch,
+            )
+        }
+    }
+
+    fun addRemote(
+        name: String,
+        url: String,
+    ) {
+        val normalizedName = runCatching {
+            GitWorkflowPolicy.normalizeRemoteName(name)
+        }.getOrElse {
+            showError(it.message ?: "Invalid remote name.")
+            return
+        }
+        val normalizedUrl = runCatching {
+            GitWorkflowPolicy.normalizeGitHubRemoteUrl(url)
+        }.getOrElse {
+            showError(it.message ?: "Invalid remote URL.")
+            return
+        }
+
+        launchOperation("Added remote " + normalizedName + ".") {
+            gitEngine.addRemote(
+                repositoryPath = workspacePath,
+                name = normalizedName,
+                url = normalizedUrl,
+            )
+        }
+    }
+
+    fun renameRemote(
+        oldName: String,
+        newName: String,
+    ) {
+        val normalized = runCatching {
+            GitWorkflowPolicy.normalizeRemoteName(newName)
+        }.getOrElse {
+            showError(it.message ?: "Invalid remote name.")
+            return
+        }
+
+        launchOperation(
+            "Renamed " + oldName + " to " + normalized + ".",
+        ) {
+            gitEngine.renameRemote(
+                repositoryPath = workspacePath,
+                oldName = oldName,
+                newName = normalized,
+            )
+        }
+    }
+
+    fun removeRemote(name: String) {
+        launchOperation("Removed remote " + name + ".") {
+            gitEngine.removeRemote(
+                repositoryPath = workspacePath,
+                name = name,
+            )
+        }
+    }
+
+    fun setUpstream(upstream: String?) {
+        val current = state.value.branch
+        if (current.isBlank()) {
+            showError("A checked-out local branch is required.")
+            return
+        }
+
+        launchOperation(
+            if (upstream.isNullOrBlank()) {
+                "Removed upstream from " + current + "."
+            } else {
+                "Tracking " + upstream + "."
+            },
+        ) {
+            gitEngine.setUpstream(
+                repositoryPath = workspacePath,
+                branch = current,
+                upstream = upstream,
+            )
+        }
+    }
+
+    fun fetch(remote: String) {
+        val normalized = runCatching {
+            GitWorkflowPolicy.normalizeRemoteName(remote)
+        }.getOrElse {
+            showError(it.message ?: "Invalid remote.")
+            return
+        }
+
+        viewModelScope.launch {
+            scheduleDurableOperation {
+                durableGitOperations.enqueueFetch(
+                    workspaceId = workspaceId,
+                    remote = normalized,
+                )
+            }
+        }
+    }
+
+    fun pull(
+        remote: String,
+        strategy: GitPullStrategy,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        if (state.value.conflicts.isNotEmpty()) {
+            showError(
+                "Resolve the current conflicts before pulling again.",
+            )
+            return
+        }
+
+        val author = authorOrNull(authorName, authorEmail) ?: return
+        val normalized = runCatching {
+            GitWorkflowPolicy.normalizeRemoteName(remote)
+        }.getOrElse {
+            showError(it.message ?: "Invalid remote.")
+            return
+        }
+
+        viewModelScope.launch {
+            scheduleDurableOperation {
+                durableGitOperations.enqueuePull(
+                    workspaceId = workspaceId,
+                    remote = normalized,
+                    strategy = strategy,
+                    authorName = author.name,
+                    authorEmail = author.email,
+                )
+            }
+        }
+    }
+
+    fun continueMerge(
+        authorName: String,
+        authorEmail: String,
+    ) {
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        launchMergeOperation("Continue merge") {
+            gitEngine.continueMerge(
+                repositoryPath = workspacePath,
+                author = author,
+            )
+        }
+    }
+
+    fun continueRebase(
+        authorName: String,
+        authorEmail: String,
+    ) {
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        launchMergeOperation("Continue rebase") {
+            gitEngine.continueRebase(
+                repositoryPath = workspacePath,
+                author = author,
+            )
+        }
+    }
+
+    fun abortRebase() {
+        launchOperation("Rebase aborted and original branch restored.") {
+            gitEngine.abortRebase(workspacePath)
+        }
+    }
+
+    fun rebase(
+        upstreamRef: String,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        if (upstreamRef.isBlank()) {
+            showError("Choose a branch, tag, or commit to rebase onto.")
+            return
+        }
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        launchMergeOperation("Rebase onto " + upstreamRef.trim()) {
+            gitEngine.rebase(
+                repositoryPath = workspacePath,
+                upstreamRef = upstreamRef.trim(),
+                author = author,
+            )
+        }
+    }
+
+    fun cherryPick(
+        commitRef: String,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        if (commitRef.isBlank()) {
+            showError("Choose a commit to cherry-pick.")
+            return
+        }
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        launchApplyOperation("Cherry-pick " + commitRef.trim()) {
+            gitEngine.cherryPick(
+                repositoryPath = workspacePath,
+                commitRef = commitRef.trim(),
+                author = author,
+            )
+        }
+    }
+
+    fun continueCherryPick(
+        authorName: String,
+        authorEmail: String,
+    ) {
+        val author = authorOrNull(authorName, authorEmail) ?: return
+        launchApplyOperation("Continue cherry-pick") {
+            gitEngine.continueCherryPick(
+                repositoryPath = workspacePath,
+                author = author,
+            )
+        }
+    }
+
+    fun abortCherryPick() {
+        launchOperation("Cherry-pick aborted.") {
+            gitEngine.abortCherryPick(workspacePath)
+        }
+    }
+
+    fun saveStash(
+        message: String,
+        authorName: String,
+        authorEmail: String,
+        includeUntracked: Boolean,
+    ) {
+        val author = authorOrNull(authorName, authorEmail) ?: return
+        launchOperation {
+            val oid = gitEngine.saveStash(
+                repositoryPath = workspacePath,
+                message = message.trim(),
+                author = author,
+                includeUntracked = includeUntracked,
+            )
+            "Saved stash " + oid.take(7) + "."
+        }
+    }
+
+    fun applyStash(index: Int, pop: Boolean) {
+        launchOperation(
+            if (pop) "Popped stash@$index." else "Applied stash@$index.",
+        ) {
+            gitEngine.applyStash(
+                repositoryPath = workspacePath,
+                index = index,
+                pop = pop,
+            )
+        }
+    }
+
+    fun dropStash(index: Int) {
+        launchOperation("Dropped stash@$index.") {
+            gitEngine.dropStash(
+                repositoryPath = workspacePath,
+                index = index,
+            )
+        }
+    }
+
+    fun reset(
+        targetRef: String,
+        mode: GitResetMode,
+    ) {
+        if (targetRef.isBlank()) {
+            showError("Reset target is required.")
+            return
+        }
+        launchOperation(
+            "Reset " + mode.name.lowercase() +
+                " to " + targetRef.trim() + ".",
+        ) {
+            gitEngine.reset(
+                repositoryPath = workspacePath,
+                targetRef = targetRef.trim(),
+                mode = mode,
+            )
+        }
+    }
+
+    fun revert(
+        commitRef: String,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        if (commitRef.isBlank()) {
+            showError("Choose a commit to revert.")
+            return
+        }
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        launchApplyOperation("Revert " + commitRef.trim()) {
+            gitEngine.revert(
+                repositoryPath = workspacePath,
+                commitRef = commitRef.trim(),
+                author = author,
+            )
+        }
+    }
+
+    fun continueRevert(
+        authorName: String,
+        authorEmail: String,
+    ) {
+        val author = authorOrNull(authorName, authorEmail) ?: return
+        launchApplyOperation("Continue revert") {
+            gitEngine.continueRevert(
+                repositoryPath = workspacePath,
+                author = author,
+            )
+        }
+    }
+
+    fun abortRevert() {
+        launchOperation("Revert aborted.") {
+            gitEngine.abortRevert(workspacePath)
+        }
+    }
+
+    fun createTag(
+        name: String,
+        targetRef: String,
+        message: String,
+        annotated: Boolean,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        val normalized = name.trim()
+        if (normalized.isBlank() ||
+            normalized.any { it.isWhitespace() } ||
+            normalized.startsWith("-") ||
+            normalized.contains("..")
+        ) {
+            showError("Enter a valid local Git tag name.")
+            return
+        }
+
+        val author = authorOrNull(authorName, authorEmail) ?: return
+        launchOperation {
+            val oid = gitEngine.createTag(
+                repositoryPath = workspacePath,
+                name = normalized,
+                targetRef = targetRef.trim().ifBlank { "HEAD" },
+                message = message.trim(),
+                author = author,
+                annotated = annotated,
+            )
+            "Created tag " + normalized + " at " + oid.take(7) + "."
+        }
+    }
+
+    fun deleteTag(name: String) {
+        launchOperation("Deleted local tag " + name + ".") {
+            gitEngine.deleteTag(
+                repositoryPath = workspacePath,
+                name = name,
+            )
+        }
+    }
+
+    fun syncSubmodule(name: String) {
+        launchOperation("Synced submodule " + name + ".") {
+            gitEngine.syncSubmodule(
+                repositoryPath = workspacePath,
+                name = name,
+            )
+        }
+    }
+
+    fun updateSubmodule(name: String) {
+        launchOperation("Updated submodule " + name + ".") {
+            gitEngine.updateSubmodule(
+                repositoryPath = workspacePath,
+                name = name,
+                initialize = true,
+            )
+        }
+    }
+
+    fun trackLfs(pattern: String) {
+        launchOperation {
+            withContext(Dispatchers.IO) {
+                lfsManager.track(workspacePath, pattern)
+            }
+            "Tracking " + pattern.trim() + " with Git LFS attributes."
+        }
+    }
+
+    fun untrackLfs(pattern: String) {
+        launchOperation {
+            withContext(Dispatchers.IO) {
+                lfsManager.untrack(workspacePath, pattern)
+            }
+            "Removed Git LFS tracking for " + pattern + "."
+        }
+    }
+
+    fun downloadLfs(remoteName: String) {
+        val remote = state.value.remotes.firstOrNull {
+            it.name == remoteName
+        }
+        if (remote == null) {
+            showError("Choose a configured remote for Git LFS.")
+            return
+        }
+        if (!lfsTransport.supportsRemote(remote.url)) {
+            showError(
+                "Git LFS object transfer currently supports GitHub HTTPS remotes.",
+            )
+            return
+        }
+
+        launchOperation {
+            val result = lfsTransport.downloadMissing(
+                repositoryPath = workspacePath,
+                remoteUrl = remote.url,
+            )
+            "Git LFS download: " +
+                result.transferred + " transferred · " +
+                result.alreadyPresent + " already local."
+        }
+    }
+
+    fun uploadLfs(remoteName: String) {
+        val remote = state.value.remotes.firstOrNull {
+            it.name == remoteName
+        }
+        if (remote == null) {
+            showError("Choose a configured remote for Git LFS.")
+            return
+        }
+        if (!lfsTransport.supportsRemote(remote.url)) {
+            showError(
+                "Git LFS object transfer currently supports GitHub HTTPS remotes.",
+            )
+            return
+        }
+
+        launchOperation {
+            val result = lfsTransport.uploadPending(
+                repositoryPath = workspacePath,
+                remoteUrl = remote.url,
+            )
+            "Git LFS upload: " +
+                result.transferred + " transferred · " +
+                result.alreadyPresent + " already remote."
+        }
+    }
+
+    fun merge(
+        ref: String,
+        authorName: String,
+        authorEmail: String,
+    ) {
+        if (ref.isBlank()) {
+            showError("Choose a branch or remote ref to merge.")
+            return
+        }
+        val author = authorOrNull(authorName, authorEmail) ?: return
+
+        launchMergeOperation("Merge " + ref) {
+            gitEngine.merge(
+                repositoryPath = workspacePath,
+                ref = ref,
+                author = author,
+            )
+        }
+    }
+
+    fun push(
+        remote: String,
+        targetBranch: String,
+        forceWithLease: Boolean,
+    ) {
+        val current = state.value.branch
+        if (current.isBlank()) {
+            showError("Push requires a checked-out local branch.")
+            return
+        }
+
+        val normalizedRemote = runCatching {
+            GitWorkflowPolicy.normalizeRemoteName(remote)
+        }.getOrElse {
+            showError(it.message ?: "Invalid remote.")
+            return
+        }
+
+        val target = runCatching {
+            GitWorkflowPolicy.normalizeBranchName(
+                targetBranch.ifBlank { current },
+            )
+        }.getOrElse {
+            showError(it.message ?: "Invalid push branch.")
+            return
+        }
+
+        viewModelScope.launch {
+            scheduleDurableOperation {
+                durableGitOperations.enqueuePush(
+                    workspaceId = workspaceId,
+                    remote = normalizedRemote,
+                    targetBranch = target,
+                    forceWithLease = forceWithLease,
+                )
+            }
+        }
+    }
+
+    fun resolveConflictSide(
+        path: String,
+        resolution: GitConflictResolution,
+    ) {
+        launchOperation(
+            "Resolved " + path + " using " +
+                resolution.name.lowercase() + ".",
+        ) {
+            gitEngine.resolveConflict(
+                repositoryPath = workspacePath,
+                path = path,
+                resolution = resolution,
+            )
+        }
+    }
+
+    fun markConflictResolved(path: String) {
+        launchOperation("Marked " + path + " as resolved.") {
+            withContext(Dispatchers.IO) {
+                val root = File(workspacePath).canonicalFile
+                val file = File(root, path).canonicalFile
+                val rootPrefix = root.path + File.separator
+
+                require(
+                    file.path == root.path ||
+                        file.path.startsWith(rootPrefix),
+                ) {
+                    "Conflict path escapes the workspace."
+                }
+                require(file.isFile) {
+                    "Conflict file does not exist."
+                }
+
+                val text = file.readText()
+                require(
+                    !GitWorkflowPolicy.hasConflictMarkers(text),
+                ) {
+                    "Conflict markers are still present. Finish editing before marking the file resolved."
+                }
+            }
+
+            gitEngine.stage(
+                repositoryPath = workspacePath,
+                paths = listOf(path),
+            )
+        }
+    }
+
+    fun dismissError() {
+        mutableState.update {
+            it.copy(errorMessage = null)
+        }
+    }
+
+    fun dismissSuccess() {
+        mutableState.update {
+            it.copy(successMessage = null)
+        }
+    }
+
+    private fun load() {
+        viewModelScope.launch {
+            if (workspaceId.isBlank()) {
+                mutableState.update {
+                    it.copy(
+                        loading = false,
+                        errorMessage = "Workspace is missing.",
+                    )
+                }
+                return@launch
+            }
+
+            runCatching {
+                workspaceRegistry.findById(workspaceId)
+                    ?: error("Workspace not found")
+            }.onSuccess { workspace ->
+                workspacePath = workspace.workspacePath
+                val gitDirectory = File(workspacePath, ".git")
+                if (!gitDirectory.isDirectory) {
+                    mutableState.update {
+                        it.copy(
+                            workspaceName = workspace.name,
+                            repositoryPath = workspacePath,
+                            loading = false,
+                            errorMessage =
+                                "This workspace is not initialized as a Git repository.",
+                        )
+                    }
+                    return@onSuccess
+                }
+
+                mutableState.update {
+                    it.copy(
+                        workspaceName = workspace.name,
+                        repositoryPath = workspacePath,
+                    )
+                }
+                refreshInternal(showBusy = false)
+            }.onFailure { error ->
+                mutableState.update {
+                    it.copy(
+                        loading = false,
+                        errorMessage = error.message
+                            ?: "Unable to open Git workspace.",
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun refreshInternal(
+        showBusy: Boolean,
+    ) {
+        if (workspacePath.isBlank()) return
+
+        mutableState.update {
+            it.copy(
+                loading = if (showBusy) it.loading else true,
+                refreshing = showBusy,
+                errorMessage = null,
+            )
+        }
+
+        runCatching {
+            val status = gitEngine.status(workspacePath)
+            val branches = gitEngine.branches(workspacePath)
+            val history = gitEngine.history(
+                repositoryPath = workspacePath,
+                limit = 80,
+            )
+            val repositoryState =
+                gitEngine.repositoryState(workspacePath)
+            val conflicts = if (
+                status.conflicted ||
+                repositoryState !=
+                    GitRepositoryOperationState.NONE
+            ) {
+                gitEngine.conflicts(workspacePath)
+            } else {
+                emptyList()
+            }
+            val remotes = gitEngine.remotes(workspacePath)
+            val stashes = gitEngine.stashes(workspacePath)
+            val tags = gitEngine.tags(workspacePath)
+            val submodules = gitEngine.submodules(workspacePath)
+            val lfs = withContext(Dispatchers.IO) {
+                lfsManager.inspect(workspacePath)
+            }
+
+            val current = branches.firstOrNull {
+                !it.remote && it.head
+            }
+            val divergence = current
+                ?.upstream
+                ?.takeIf(String::isNotBlank)
+                ?.let { upstream ->
+                    runCatching {
+                        gitEngine.divergence(
+                            repositoryPath = workspacePath,
+                            localRef = status.branch,
+                            upstreamRef = upstream,
+                        )
+                    }.getOrNull()
+                }
+
+            Snapshot(
+                branch = status.branch,
+                entries = status.entries,
+                history = history,
+                branches = branches,
+                remotes = remotes,
+                conflicts = conflicts,
+                divergence = divergence,
+                repositoryState = repositoryState,
+                stashes = stashes,
+                tags = tags,
+                submodules = submodules,
+                lfs = lfs,
+            )
+        }.onSuccess { snapshot ->
+            val origin = snapshot.remotes.firstOrNull {
+                it.name == "origin"
+            }
+
+            runCatching {
+                workspaceRegistry.bindRepository(
+                    workspaceId = workspaceId,
+                    remoteUrl = origin?.url,
+                    currentBranch = snapshot.branch
+                        .takeIf(String::isNotBlank),
+                    accountId = null,
+                )
+            }
+
+            mutableState.update {
+                it.copy(
+                    branch = snapshot.branch,
+                    entries = snapshot.entries,
+                    history = snapshot.history,
+                    branches = snapshot.branches,
+                    remotes = snapshot.remotes,
+                    conflicts = snapshot.conflicts,
+                    divergence = snapshot.divergence,
+                    repositoryState =
+                        snapshot.repositoryState,
+                    stashes = snapshot.stashes,
+                    tags = snapshot.tags,
+                    submodules = snapshot.submodules,
+                    lfs = snapshot.lfs,
+                    loading = false,
+                    refreshing = false,
+                )
+            }
+        }.onFailure { error ->
+            mutableState.update {
+                it.copy(
+                    loading = false,
+                    refreshing = false,
+                    errorMessage = friendlyGitError(error),
+                )
+            }
+        }
+    }
+
+    fun cancelDurableOperation() {
+        val id = state.value.durableOperationId
+            ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            ?: return
+        durableGitOperations.cancel(id)
+    }
+
+    private fun restoreDurableOperation() {
+        val raw = savedStateHandle.get<String>(KEY_DURABLE_GIT_ID)
+            ?: return
+        val id = runCatching { UUID.fromString(raw) }.getOrNull()
+            ?: run {
+                savedStateHandle.remove<String>(KEY_DURABLE_GIT_ID)
+                return
+            }
+        viewModelScope.launch {
+            observeDurableOperation(id)
+        }
+    }
+
+    private suspend fun scheduleDurableOperation(
+        enqueue: suspend () -> UUID,
+    ) {
+        mutableState.update {
+            it.copy(
+                operationInProgress = true,
+                errorMessage = null,
+                successMessage = null,
+                durableOperationPhase = "queued",
+            )
+        }
+
+        runCatching { enqueue() }
+            .onSuccess { id ->
+                savedStateHandle[KEY_DURABLE_GIT_ID] = id.toString()
+                observeDurableOperation(id)
+            }
+            .onFailure { error ->
+                mutableState.update {
+                    it.copy(
+                        operationInProgress = false,
+                        durableOperationPhase = null,
+                        errorMessage = friendlyGitError(error),
+                    )
+                }
+            }
+    }
+
+    private suspend fun observeDurableOperation(id: UUID) {
+        mutableState.update {
+            it.copy(
+                operationInProgress = true,
+                durableOperationId = id.toString(),
+            )
+        }
+
+        val terminal = durableGitOperations.observe(id).first { info ->
+            val phase = info.progress
+                .getString(DurableGitWorker.KEY_PHASE)
+                ?: if (info.state == WorkInfo.State.ENQUEUED ||
+                    info.state == WorkInfo.State.BLOCKED
+                ) {
+                    "queued"
+                } else {
+                    state.value.durableOperationPhase
+                }
+            mutableState.update {
+                it.copy(durableOperationPhase = phase)
+            }
+            info.state.isFinished
+        }
+
+        savedStateHandle.remove<String>(KEY_DURABLE_GIT_ID)
+        mutableState.update {
+            it.copy(
+                operationInProgress = false,
+                durableOperationId = null,
+                durableOperationPhase = null,
+            )
+        }
+
+        when (terminal.state) {
+            WorkInfo.State.SUCCEEDED -> {
+                refreshInternal(showBusy = false)
+                mutableState.update {
+                    it.copy(
+                        successMessage = terminal.outputData
+                            .getString(DurableGitWorker.KEY_MESSAGE)
+                            ?: "Git operation completed.",
+                    )
+                }
+            }
+            WorkInfo.State.CANCELLED ->
+                showError("Git operation was canceled.")
+            WorkInfo.State.FAILED ->
+                showError(
+                    terminal.outputData
+                        .getString(DurableGitWorker.KEY_ERROR)
+                        ?: "Git operation failed.",
+                )
+            else -> Unit
+        }
+    }
+
+    private fun launchOperation(
+        successMessage: String,
+        operation: suspend () -> Unit,
+    ) {
+        launchOperation {
+            operation()
+            successMessage
+        }
+    }
+
+    private fun launchOperation(
+        operation: suspend () -> String,
+    ) {
+        viewModelScope.launch {
+            mutableState.update {
+                it.copy(
+                    operationInProgress = true,
+                    errorMessage = null,
+                    successMessage = null,
+                )
+            }
+
+            runCatching {
+                operation()
+            }.onSuccess { message ->
+                refreshInternal(showBusy = false)
+                mutableState.update {
+                    it.copy(
+                        operationInProgress = false,
+                        successMessage = message,
+                    )
+                }
+            }.onFailure { error ->
+                mutableState.update {
+                    it.copy(operationInProgress = false)
+                }
+                showError(friendlyGitError(error))
+            }
+        }
+    }
+
+    private fun launchMergeOperation(
+        label: String,
+        operation: suspend () -> GitMergeResult,
+    ) {
+        launchOperation {
+            val result = operation()
+            when {
+                result.conflicts.isNotEmpty() ->
+                    label + " produced " +
+                        result.conflicts.size +
+                        " conflict(s). Resolve them in the editor."
+                result.commitOid.isNotBlank() ->
+                    label + " completed at " +
+                        result.commitOid.take(7) + "."
+                else ->
+                    label + " completed: " +
+                        result.state.name.lowercase()
+                            .replace('_', ' ') + "."
+            }
+        }
+    }
+
+    private fun launchApplyOperation(
+        label: String,
+        operation: suspend () -> GitApplyResult,
+    ) {
+        launchOperation {
+            val result = operation()
+            if (result.conflicts.isNotEmpty()) {
+                label + " produced " +
+                    result.conflicts.size +
+                    " conflict(s). Resolve them before continuing."
+            } else {
+                label + " completed at " +
+                    result.commitOid.take(7) + "."
+            }
+        }
+    }
+
+    private fun authorOrNull(
+        name: String,
+        email: String,
+    ): GitAuthor? {
+        if (name.isBlank() || email.isBlank()) {
+            showError(
+                "Commit author name and email are required.",
+            )
+            return null
+        }
+        return GitAuthor(
+            name = name.trim(),
+            email = email.trim(),
+        )
+    }
+
+    private fun friendlyGitError(error: Throwable): String {
+        val raw = error.message
+            ?.takeIf(String::isNotBlank)
+            ?: "Git operation failed."
+        val text = raw.lowercase()
+
+        return when {
+            "non-fast" in text ||
+                "nonfast" in text ->
+                "The remote branch contains commits that are not in your local branch. Fetch first, review ahead/behind, then merge, rebase, or use Force with lease only when you intentionally need to rewrite the remote branch."
+
+            "force-with-lease rejected" in text ->
+                "Force with lease was rejected because the remote branch changed after your last verified state. Fetch again and review the new commits before retrying."
+
+            "protected branch" in text ||
+                "protected_branch" in text ->
+                "GitHub rejected this update because branch protection or a repository rule applies. Nexora Git will not bypass those protections."
+
+            else -> raw
+        }
+    }
+
+    private fun showError(message: String) {
+        mutableState.update {
+            it.copy(errorMessage = message)
+        }
+    }
+
+    private data class Snapshot(
+        val branch: String,
+        val entries: List<GitStatusEntry>,
+        val history: List<GitHistoryEntry>,
+        val branches: List<GitBranch>,
+        val remotes: List<GitRemote>,
+        val conflicts: List<GitConflict>,
+        val divergence: GitDivergence?,
+        val repositoryState: GitRepositoryOperationState,
+        val stashes: List<GitStash>,
+        val tags: List<GitTag>,
+        val submodules: List<GitSubmodule>,
+        val lfs: GitLfsState,
+    )
+    companion object {
+        private const val KEY_DURABLE_GIT_ID = "durable_git_work_id"
+    }
+
+}
