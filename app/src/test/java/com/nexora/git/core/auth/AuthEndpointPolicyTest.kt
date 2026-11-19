@@ -86,4 +86,64 @@ class AuthEndpointPolicyTest {
         )
     }
 
+    @Test
+    fun rejectsCiSentinelRuntimeConfiguration() {
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.NexoraObfuscationSentinel",
+                brokerBaseUrl = "https://obfuscation-sentinel.example",
+            ),
+        )
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.NexoraEphemeralCiOnly",
+                brokerBaseUrl = "https://ci-signing.invalid",
+            ),
+        )
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.your-client-id",
+                brokerBaseUrl = "https://your-nexora-git-domain.example",
+            ),
+        )
+    }
+
+    @Test
+    fun rejectsReservedOrEmptyRuntimeConfiguration() {
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.0123456789abcdef",
+                brokerBaseUrl = "https://auth.example.com",
+            ),
+        )
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.0123456789abcdef",
+                brokerBaseUrl = "https://auth.nexoragit.test",
+            ),
+        )
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "",
+                brokerBaseUrl = "https://auth.nexoragit.dev",
+            ),
+        )
+        assertTrue(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.0123456789abcdef",
+                brokerBaseUrl = "",
+            ),
+        )
+    }
+
+    @Test
+    fun acceptsRealisticRuntimeConfiguration() {
+        assertFalse(
+            isPlaceholderRuntimeConfig(
+                githubClientId = "Iv1.0123456789abcdef",
+                brokerBaseUrl = "https://auth.nexoragit.dev",
+            ),
+        )
+    }
+
 }
