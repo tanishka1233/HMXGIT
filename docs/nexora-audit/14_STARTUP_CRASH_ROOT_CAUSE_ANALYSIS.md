@@ -1,20 +1,46 @@
 # 14 — Startup Crash Root Cause Analysis
 
 > **Commit:** `f4befb6c1954d956f0a67b14f4ab1642aa185833` · **Audit date:** 2026-11-19
-> **Constraint:** the application was **not built, installed or launched** by this audit. The user
-> prohibited local builds on the low-RAM Termux host, and no Android device or emulator was
-> available. Therefore **no crash was reproduced and no Logcat was captured.**
+> **Status:** source-proven **and device-confirmed** (2026-11-19).
 >
-> Everything below is a **static root-cause analysis** with explicit confidence levels. The
-> reconstructed stack trace in §4 is derived from source and the AppCompat implementation; it is
-> **not** a captured trace.
+> The audit itself did not build or launch the app. The project owner later reproduced the crash on
+> a physical **OPPO** device in **night mode** and captured Logcat. That evidence is recorded in §0
+> and supersedes the earlier "static only" caveat. The reconstructed trace in §4 is kept for
+> reference; the actual captured frame chain is quoted in §0.
+
+---
+
+## 0. Device-confirmed evidence (2026-11-19)
+
+| Field | Captured value |
+| --- | --- |
+| Application ID | `com.nexora.git.debug` |
+| Activity | `com.nexora.git.MainActivity` |
+| Crash location | `MainActivity.kt:40` |
+| Exception | `java.lang.IllegalStateException` |
+| Message | `You need to use a Theme.AppCompat theme (or descendant) with this activity.` |
+| Frame chain | `AppCompatDelegateImpl.createSubDecor` → `AppCompatActivity.setContentView` → `ComponentActivityKt.setContent` → `MainActivity.onCreate` |
+| Device configuration | Night mode |
+
+This is the **exact** exception text, Activity, crash line and call chain predicted in §3 and §4 of
+this report. The static analysis is therefore validated: the night-qualified theme
+(`values-night/styles.xml`) is the cause, and the failure occurs in the fourth statement of
+`onCreate`, before any Compose content exists.
+
+Consequences for this report:
+
+- BUG-001 is no longer "high confidence, unconfirmed" — it is **reproduced**.
+- The trigger is confirmed to be **device night mode**, not an in-app setting (BUG-002 remains a
+  separate defect).
+- The minimal repair is the one described in §3: give the night variant an AppCompat-compatible
+  parent.
 
 ---
 
 ## 1. Symptom
 
-The user reports that Nexora Git **crashes immediately after opening** — before any usable screen is
-shown.
+Nexora Git **crashes immediately after opening** — before any usable screen is shown. Reported by
+the owner and now **reproduced on a physical device** in night mode (§0).
 
 This is consistent with a failure in the Activity's first `onCreate`, before the first Compose frame.
 It is **not** consistent with a failure after login, during a Git operation, or during rendering of a
@@ -132,10 +158,27 @@ This explains a report of "crashes sometimes" or "crashes on my phone but not th
 
 ---
 
-## 4. Reconstructed stack trace (NOT captured)
+## 4. Stack trace — predicted vs captured
 
-> **This trace is reconstructed from the source and AppCompat's implementation. It is not a Logcat
-> capture.** It is provided so the user can compare it with a real trace (report 15).
+**Captured on device (2026-11-19, OPPO, night mode):** the frame chain was reported as
+
+```
+AppCompatDelegateImpl.createSubDecor
+  → AppCompatActivity.setContentView
+    → ComponentActivityKt.setContent
+      → MainActivity.onCreate (MainActivity.kt:40)
+```
+
+with exception `java.lang.IllegalStateException` and message
+`You need to use a Theme.AppCompat theme (or descendant) with this activity.`
+
+That is frame-for-frame the chain predicted below. The block below is the full reconstruction made
+during the audit, before the device log existed; it is retained because it adds the surrounding
+framework frames.
+
+> **Reconstruction note:** this block is derived from the source and the AppCompat implementation.
+> It is not a verbatim Logcat dump (PIDs, `ActivityThread` lines and library line numbers vary per
+> device), but its frame names and message match the captured evidence in §0 exactly.
 
 ```
 FATAL EXCEPTION: main
@@ -288,28 +331,35 @@ Did the crash happen on the very first launch after install?
 | Claim | Confidence | Basis |
 | --- | --- | --- |
 | Night theme is not AppCompat-compatible | **Certain** | Direct source; AppCompat source guard at `AppCompatDelegateImpl.java:858-861` |
-| That defect throws on a dark-mode device | **Very high** | Documented AppCompat behavior; the attribute is library-scoped |
-| The throw happens before Compose renders | **Certain** | `setContent` → `setContentView` → `ensureSubDecor` |
-| The reported crash is this defect | **High, not proven** | Matches symptom and is the only deterministic zero-config cause |
+| That defect throws on a dark-mode device | **Confirmed on device** | Reproduced on a physical OPPO device in night mode (§0) |
+| The throw happens before Compose renders | **Certain** | `setContent` → `setContentView` → `ensureSubDecor`; crash at `MainActivity.kt:40` |
+| The reported crash is this defect | **Confirmed** | Captured message, Activity, line and frame chain match §0 |
 | A storage exception could also crash at startup | **Medium** | Unguarded collectors; needs damaged data |
 | A native load could crash at startup | **Medium-low** | Unguarded load; needs missing ABI and a signed-in state |
 
-**This audit does not claim the crash was reproduced.** The single missing piece is a Logcat from the
-user's device. Report 15 provides the exact commands to obtain it and a template to compare.
+**The crash is reproduced and the Logcat evidence is captured** (§0). It matches the static
+analysis exactly. Remaining residual risk is limited to the secondary causes above, which would
+produce a *different* stack trace.
 
 ---
 
 ## 11. Root-cause verdict
 
-The root cause of "crashes immediately after opening" is, with high confidence:
+The root cause of "crashes immediately after opening" is **device-confirmed**:
 
 > **`values-night/styles.xml` replaces the AppCompat theme with a framework Material theme. On a
 > dark-mode device, `AppCompatActivity.setContent` throws
 > `IllegalStateException: You need to use a Theme.AppCompat theme (or descendant) with this
 > activity` before the first Compose frame.**
 
+Evidence: reproduced on a physical OPPO device in night mode; `com.nexora.git.debug`,
+`MainActivity.kt:40`, `AppCompatDelegateImpl.createSubDecor` → `AppCompatActivity.setContentView` →
+`ComponentActivityKt.setContent` → `MainActivity.onCreate` (§0).
+
 Secondary, conditional causes are the unguarded storage collectors (BUG-011 + BUG-006) and the
 unguarded native load (BUG-003). All three are independent of authentication and network.
 
-The fix is a one-line resource change plus a night-mode launch test — but **no fix was applied in
-this audit**, per the task constraints. See report 16 for the ordered remediation.
+The minimal fix is a one-line resource change (give the night variant an AppCompat parent such as
+`Theme.AppCompat.DayNight.NoActionBar`) plus a night-mode launch test. The repair and its CI
+validation are tracked in the repository history; **device relaunch verification is a separate,
+explicitly required step** and is not claimed here.

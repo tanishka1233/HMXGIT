@@ -1,8 +1,9 @@
 # 13 — Master Bug and Error Register
 
 > **Commit:** `f4befb6c1954d956f0a67b14f4ab1642aa185833` · **Audit date:** 2026-11-19
+> **Device confirmation:** 2026-11-19 — BUG-001 reproduced on a physical OPPO device (see §1.1).
 > **Scope:** all findings from reports 03–12, de-duplicated and severity-ranked.
-> **No fix was applied.** Every entry is a record, not a change.
+> **No fix was applied at audit time.** Fix attempts are tracked separately in the CI history.
 
 ---
 
@@ -13,6 +14,7 @@
 | Total findings | **40** |
 | Confirmed from source (static) | **33** |
 | Suspected / runtime-dependent | **7** |
+| Device-confirmed runtime crashes | **1** — BUG-001 |
 | Critical (P0) | 2 |
 | High (P1) | 8 |
 | Medium (P2) | 17 |
@@ -22,8 +24,27 @@
 
 - **Confirmed (static):** the defect is present in the source at the cited lines; the code path is
   reachable. Runtime *impact* may still depend on conditions.
+- **Confirmed (device):** the defect was reproduced on a physical Android device and the crash was
+  captured in Logcat.
 - **Suspected:** the source condition exists, but the harmful outcome depends on device state,
   timing, API level or a deployment that this audit could not exercise.
+
+### 1.1 Device confirmation — BUG-001 (2026-11-19)
+
+Reproduced by the project owner on a physical **OPPO** Android device in **night mode**:
+
+| Field | Captured value |
+| --- | --- |
+| Application ID | `com.nexora.git.debug` |
+| Activity | `com.nexora.git.MainActivity` |
+| Crash location | `MainActivity.kt:40` |
+| Exception | `java.lang.IllegalStateException` |
+| Message | `You need to use a Theme.AppCompat theme (or descendant) with this activity.` |
+| Frame chain | `AppCompatDelegateImpl.createSubDecor` → `AppCompatActivity.setContentView` → `ComponentActivityKt.setContent` → `MainActivity.onCreate` |
+| Device configuration | Night mode |
+
+This converts BUG-001 from a static analysis finding to a **device-confirmed P0 startup crash**.
+The captured frame chain matches the mechanism described in §3 and in report 14 exactly.
 
 ---
 
@@ -31,7 +52,7 @@
 
 | ID | Sev | Status | Title | Primary evidence |
 | --- | --- | --- | --- | --- |
-| BUG-001 | P0 | Confirmed | Night theme is a framework Material theme, not AppCompat → immediate crash in dark mode | `app/src/main/res/values-night/styles.xml:3`; `MainActivity.kt:26,40` |
+| BUG-001 | P0 | Confirmed (device) | Night theme is a framework Material theme, not AppCompat → immediate crash in dark mode | `app/src/main/res/values-night/styles.xml:3`; `MainActivity.kt:26,40`; Logcat on OPPO device |
 | BUG-002 | P0 | Confirmed | In-app theme setting never changes the platform night mode | `SettingsViewModel.kt:49`; no `setDefaultNightMode` anywhere |
 | BUG-003 | P1 | Confirmed | Unguarded `System.loadLibrary("nexoragit_native")` in two classes | `NativeGitBridge.kt:316-323`; `NativeSyntaxBridge.kt:15-19` |
 | BUG-004 | P1 | Confirmed | No per-repository operation lock; UI and WorkManager can write concurrently | no `Mutex` in `core/git`/`core/work`; `Libgit2GitEngine` is `@Singleton` |
@@ -92,7 +113,9 @@
   `Theme.Material` parent cannot satisfy it.
 - **Trigger:** device (or app) in night mode. Deterministic on API 29+ with system dark theme.
 - **Impact:** process death before the first Compose frame. No UI, no error dialog.
-- **Status:** Confirmed (static). Runtime crash unconfirmed (no device).
+- **Status:** **Confirmed (device)** — reproduced on a physical OPPO device in night mode with
+  `com.nexora.git.debug`; captured message and frame chain are recorded in §1.1. The crash site is
+  `MainActivity.kt:40` (`setContent`), exactly as predicted statically.
 - **Fix direction:** use `Theme.AppCompat.DayNight.NoActionBar` in `values-night` too, or move to
   `ComponentActivity`. Then add a night-mode launch test.
 

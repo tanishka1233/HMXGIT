@@ -246,3 +246,80 @@ Once authorised, the first source change is the P0 fix described in report 16:
 - Map the in-app theme setting to `AppCompatDelegate.setDefaultNightMode` (`BUG-002`).
 
 No fix has been applied. Awaiting the go-ahead.
+
+---
+
+## 12. Appendix — post-baseline P0 change verification
+
+The owner subsequently authorised the BUG-001 repair and supplied device-captured Logcat evidence
+(recorded in reports 13 §1.1 and 14 §0). The baseline itself — §1 to §10 — is unchanged and remains
+the green reference at `3f8aa6c` / `ffa8036`.
+
+### 12.1 Change under test
+
+Commit **`729f11c70248280efe5a419c0a3d4e0e516fbb25`** — one line:
+
+```diff
+-    <style name="Theme.NexoraGit" parent="android:style/Theme.Material.NoActionBar">
++    <style name="Theme.NexoraGit" parent="Theme.AppCompat.DayNight.NoActionBar">
+```
+
+File: `app/src/main/res/values-night/styles.xml`. No other file changed.
+
+### 12.2 CI runs on `729f11c`
+
+| Workflow | Run | Result |
+| --- | ---: | --- |
+| Android CI | 44550719684 | **success (attempt 2)** — attempt 1 failed transiently, see 12.3 |
+| Production CI | 44550719662 | success |
+| CodeQL | 44550719705 | success |
+| Foundation CI | 44550719818 | success |
+
+Android CI completed the full `:app:assembleDebug`, `:app:assembleDebugAndroidTest`,
+`:baselineprofile:assemble`, `:app:testDebugUnitTest`, `:app:lintDebug` and uploaded the debug APK.
+
+### 12.3 Transient Android CI packaging failure (attempt 1)
+
+Attempt 1 failed in `:app:packageDebug`:
+
+```
+Execution failed for task ':app:packageDebug'.
+> A failure occurred while executing
+  com.android.build.gradle.tasks.PackageAndroidArtifact$IncrementalSplitterRunnable
+```
+
+No cause line was emitted by AGP, no disk/heap/space error appeared anywhere in the log, and the same
+commit passed Production CI's release packaging in parallel. The job was re-run **unchanged**
+(attempt 2) and passed in full. This is recorded as a transient runner-side packaging fault, not a
+defect introduced by the theme change. Nothing was modified to make it pass.
+
+### 12.4 APK content check
+
+The CI-produced `NexoraGit-debug` artifact (68 MB, run 44550719684) was inspected locally with
+`aapt2 dump resources`. Both configurations now resolve the theme to an AppCompat parent:
+
+```
+resource 0x7f0d010e style/Theme.NexoraGit
+  ()      (style) size=5 parent=style/Theme.AppCompat.DayNight.NoActionBar
+  (night) (style) size=5 parent=style/Theme.AppCompat.DayNight.NoActionBar
+```
+
+The night variant keeps `windowLightStatusBar=false` (attr `0x010104e0=false`); the light variant
+keeps `true`. So the compiled artifact contains the intended fix in the exact configuration that
+previously crashed.
+
+### 12.5 Device launch verification — NOT COMPLETE
+
+Per the owner's instruction, no local Gradle build was run. The CI APK was downloaded for an
+on-device test, but the wireless-ADB connection dropped during the install flow
+(`192.168.0.103:45165` → `offline`, then connection refused; the host is still pingable, so the
+debug port rotated or wireless debugging was switched off).
+
+Therefore:
+
+- the fix is **committed, CI-verified and present in the built APK**;
+- an actual post-fix launch on the physical OPPO device has **not** been observed;
+- the crash is **not** claimed as fixed until that launch succeeds.
+
+Reproduction steps for the pending test are in report 15.
+
