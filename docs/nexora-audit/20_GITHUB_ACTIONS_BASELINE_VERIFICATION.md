@@ -310,7 +310,7 @@ The night variant keeps `windowLightStatusBar=false` (attr `0x010104e0=false`); 
 keeps `true`. So the compiled artifact contains the intended fix in the exact configuration that
 previously crashed.
 
-### 12.5 Device launch verification — INSTALLED, NOT YET LAUNCHED
+### 12.5 Device launch verification — DEVICE-CONFIRMED
 
 Per the owner's instruction, no local Gradle build was run. The CI APK (`app-debug.apk`, 70 258 381
 bytes) was downloaded and installed on the physical OPPO device (CPH2579, Android 15). The install
@@ -339,5 +339,20 @@ Status therefore:
 - the crash is **not** claimed as fixed until that launch succeeds.
 
 Reproduction steps for the pending test are in report 15.
+
+### 12.6 Owner confirmation (2026-11-19)
+
+The owner reported that the repaired build **opens successfully** on the same OPPO device in the
+same night-mode configuration that previously crashed:
+
+> "I have successfully launched the application on my Android device."
+
+The device evidence in report 13 §1.1 was captured against the pre-fix build; this later launch is
+the post-fix confirmation. **BUG-001 is therefore closed on device** (dark-mode launch succeeds;
+no `IllegalStateException` reported). Light-mode launch was not separately observed, but the light
+theme already used an AppCompat parent before the fix, so the same path is covered by construction.
+
+No further automation-side launch was possible because wireless ADB was offline at that time.
+
 
 
